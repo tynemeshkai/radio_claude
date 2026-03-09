@@ -1,0 +1,39 @@
+[Unit]
+Description=LOCAL FARTS Radio Service
+# Жесткая сцепка: запускаем ТОЛЬКО после сети и Icecast
+After=network-online.target icecast2.service
+Wants=network-online.target
+Requires=icecast2.service
+
+# Защита от "безумного рестарта" (5 раз за 60 сек = стоп)
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+User=liquidsoap
+Group=liquidsoap
+ExecStartPre=
+
+# === ИНИЦИАЛИЗАЦИЯ (КРИТИЧНО ДЛЯ HLS) ===
+# При каждом ребуте папка в RAM удаляется. Создаем её заново до старта.
+ExecStartPre=/usr/bin/install -d -o liquidsoap -g www-data -m 775 /dev/shm/hls
+
+# === КОМАНДА ЗАПУСКА ===
+ExecStart=/usr/local/bin/liquidsoap-opam /etc/liquidsoap/localfarts.liq
+
+# === НАДЕЖНОСТЬ ===
+Restart=always
+# Даем Icecast 5 секунд на подъем перед тем, как стучаться в него
+RestartSec=5
+TimeoutStopSec=20
+
+# === ПРИОРИТЕТ И РЕСУРСЫ ===
+# Высокий приоритет CPU (чтобы звук не заикался)
+Nice=-15
+# Лимиты для генерации HLS-сегментов и множества соединений
+LimitNOFILE=65536
+# Броня от OOM Killer (Linux не убьет этот процесс при нехватке памяти)
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

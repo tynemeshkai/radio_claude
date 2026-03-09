@@ -1,0 +1,26 @@
+[Unit]
+Description=LOCAL FARTS Server-Sent Events (SSE) Microservice
+# Ждем поднятия сети и основного сервиса радио
+After=network.target localfarts.service
+# Жесткая привязка: если localfarts.service падает или перезапускается, этот сервис делает то же самое
+BindsTo=localfarts.service
+
+[Service]
+Type=simple
+# Указываем полный путь до интерпретатора и скрипта
+ExecStart=/usr/bin/python3 /usr/local/bin/sse_server.py
+
+# Политика авто-перезапуска при падениях (например, если кто-то случайно убил процесс)
+Restart=always
+RestartSec=3
+
+# Снимаем ограничения на количество открытых файлов (важно для тысяч SSE-подключений)
+LimitNOFILE=100000
+
+# Логирование (будет доступно через journalctl)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=localfarts-sse
+
+[Install]
+WantedBy=multi-user.target

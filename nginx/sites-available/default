@@ -1,0 +1,353 @@
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name localfarts.lol www.localfarts.lol;
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen      443 ssl http2;
+    listen      [::]:443 ssl http2;
+    server_name localfarts.lol www.localfarts.lol;
+
+    root  /var/www/html;
+    index index.html;
+
+    # --- SSL ---
+    ssl_certificate         /etc/letsencrypt/live/localfarts.lol/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/localfarts.lol/privkey.pem;
+    include                 /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
+
+    # OCSP Stapling — nginx pre-fetches cert status from CA and serves it inline,
+    # eliminating a separate roundtrip on each new TLS handshake (~100ms saved).
+    ssl_stapling            on;
+    ssl_stapling_verify     on;
+    ssl_trusted_certificate /etc/letsencrypt/live/localfarts.lol/chain.pem;
+    resolver                1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout        5s;
+
+    # --- БЕЗОПАСНОСТЬ ---
+    # IMPORTANT: nginx add_header inheritance rule — if a location{} block defines
+    # ANY add_header directive, ALL add_header from parent scopes (here and http{})
+    # are silently dropped for that location. To restore headers, every location
+    # with its own add_header must start with:
+    #   include /etc/nginx/snippets/security_headers.conf;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains"                 always;
+    add_header X-Content-Type-Options    "nosniff"                                             always;
+    add_header X-Frame-Options           "SAMEORIGIN"                                          always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin"                     always;
+    add_header Permissions-Policy        "geolocation=(), microphone=(), camera=()"            always;
+    add_header Content-Security-Policy   "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; media-src 'self' blob:; connect-src 'self' https: wss:; font-src 'self'; worker-src blob:;" always;
+
+    # Simultaneous connection limit per IP (CC-attack protection)
+    limit_conn perip 50;
+
+    keepalive_requests 1000;
+
+    # ==============================================================================
+    # 1. HLS СТРИМИНГ
+    # ==============================================================================
+
+    # Master playlist — served inline by nginx, no file on disk
+    location = /hls/master.m3u8 {
+        default_type application/vnd.apple.mpegurl;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Access-Control-Allow-Origin   "*"                                       always;
+        add_header Access-Control-Allow-Methods  "GET, HEAD, OPTIONS"                      always;
+        add_header Cache-Control                 "no-cache, no-store, must-revalidate, max-age=0" always;
+
+        return 200 '#EXTM3U\n#EXT-X-VERSION:7\n\n#EXT-X-STREAM-INF:BANDWIDTH=256000,CODECS="mp4a.40.2",NAME="high"\nhigh/live.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=192000,CODECS="mp4a.40.2",NAME="mid"\nmid/live.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS="mp4a.40.2",NAME="low"\nlow/live.m3u8\n';
+    }
+
+    # HLS segments and variant playlists — served from RAM disk (/dev/shm)
+    location ^~ /hls/ {
+        auth_basic    off;
+        root          /dev/shm;
+
+        # Buffered log — reduces disk I/O at high listener counts
+        access_log    /var/log/nginx/hls_access.log combined buffer=32k flush=5s;
+        log_not_found off;
+
+        types {
+            application/vnd.apple.mpegurl  m3u8;
+            video/mp2t                     ts;
+            audio/aac                      aac;
+            video/mp4                      mp4;
+            video/iso.segment              m4s;
+        }
+        default_type application/octet-stream;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Access-Control-Allow-Origin   "*"                                       always;
+        add_header Access-Control-Allow-Methods  "GET, HEAD, OPTIONS"                      always;
+        add_header Access-Control-Expose-Headers "Date, Content-Length, Content-Range"     always;
+        add_header Accept-Ranges                 "bytes"                                   always;
+
+        # CORS preflight
+        if ($request_method = OPTIONS) {
+            add_header Access-Control-Allow-Origin  "*"                                              always;
+            add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS"                             always;
+            add_header Access-Control-Allow-Headers "Origin,Range,Accept,Content-Type,Authorization" always;
+            add_header Content-Length               0;
+            add_header Content-Type                 text/plain;
+            return 204;
+        }
+
+        # Variant playlists (.m3u8) — never cache, always fresh
+        # gzip applies here (application/vnd.apple.mpegurl is in gzip_types)
+        location ~* \.m3u8$ {
+            include /etc/nginx/snippets/security_headers.conf;
+            add_header Cache-Control                 "no-cache, no-store, must-revalidate, max-age=0" always;
+            add_header Pragma                        "no-cache"                                        always;
+            add_header Expires                       "0"                                               always;
+            add_header Access-Control-Allow-Origin   "*"                                               always;
+            add_header Access-Control-Allow-Methods  "GET, HEAD, OPTIONS"                              always;
+            add_header Access-Control-Expose-Headers "Date, Content-Length, Content-Range"             always;
+        }
+
+        # Media segments (.m4s, .mp4, .ts, .aac) — immutable, aggressive cache
+        # These MIME types are not in gzip_types — nginx will NOT attempt to gzip them
+        location ~* \.(m4s|mp4|ts|aac)$ {
+            include /etc/nginx/snippets/security_headers.conf;
+            add_header Cache-Control                 "public, max-age=3600, immutable"                always;
+            add_header Access-Control-Allow-Origin   "*"                                              always;
+            add_header Access-Control-Allow-Methods  "GET, HEAD, OPTIONS"                             always;
+            add_header Access-Control-Expose-Headers "Date, Content-Length, Content-Range"            always;
+        }
+    }
+
+    # ==============================================================================
+    # 2. МЕТАДАННЫЕ И РАДИО-ПАНЕЛЬ
+    # ==============================================================================
+
+    location = /nowplaying.json {
+        auth_basic   off;
+        root         /srv/radio/radio_data;
+        default_type application/json;
+        try_files    $uri =404;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control                 "no-cache, no-store, must-revalidate, max-age=0" always;
+        add_header Access-Control-Allow-Origin   "*"                                               always;
+        add_header Access-Control-Expose-Headers "Date"                                            always;
+    }
+
+    location = /history.json {
+        auth_basic   off;
+        root         /srv/radio/radio_data;
+        default_type application/json;
+        try_files    $uri =404;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control               "no-cache, no-store, must-revalidate, max-age=0" always;
+        add_header Access-Control-Allow-Origin "*"                                               always;
+    }
+
+    location = /history.txt {
+        auth_basic   off;
+        root         /srv/radio/radio_data;
+        default_type text/plain;
+        try_files    $uri =404;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control               "no-cache, no-store, must-revalidate, max-age=0" always;
+        add_header Access-Control-Allow-Origin "*"                                               always;
+    }
+
+    location = /live-stats.json {
+        auth_basic   off;
+        default_type application/json;
+        alias        /dev/shm/live-stats.json;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control               "no-cache, no-store, must-revalidate, max-age=0" always;
+        add_header Access-Control-Allow-Origin "*"                                               always;
+    }
+
+    # --- Прямые Аудиопотоки ---
+
+    # 301 (permanent) — clients and players cache this redirect
+    location = /stream {
+        return 301 /stream_lossless.ogg;
+    }
+
+    location = /stream_lossless.ogg {
+        auth_basic  off;
+
+        proxy_pass                 http://127.0.0.1:8000/stream_lossless.ogg;
+        proxy_http_version         1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering         off;
+        proxy_request_buffering off;
+        proxy_read_timeout      86400s;
+        proxy_send_timeout      86400s;
+        send_timeout            86400s;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Access-Control-Allow-Origin "*"                                    always;
+        add_header Cache-Control "no-cache, no-store, must-revalidate, max-age=0"     always;
+    }
+
+    # --- Админ-панель и API ---
+
+    location = /panel {
+        return 301 /panel/;
+    }
+
+    location /panel/ {
+        auth_basic off;
+        alias      /srv/radio/admin/;
+        index      index.html;
+        try_files  $uri $uri/ /panel/index.html;
+    }
+
+    location /api/ {
+        auth_basic off;
+        limit_req  zone=one burst=20 nodelay;   # stricter than static — protect API
+
+        proxy_pass                 http://127.0.0.1:8888;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 30s;
+        proxy_send_timeout 30s;
+    }
+
+    # ==============================================================================
+    # 3. SSE И WEBSOCKETS (REAL-TIME)
+    # ==============================================================================
+
+    location /events {
+        proxy_pass         http://127.0.0.1:7890/events;
+        proxy_http_version 1.1;
+
+        gzip off;                      # must be off — gzip buffers response, breaks SSE
+        proxy_set_header Connection ""; # clear Connection header, let nginx manage keepalive
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_buffering         off;
+        proxy_cache             off;
+        proxy_request_buffering off;
+        proxy_read_timeout      86400s;
+        send_timeout            86400s;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control    "no-cache" always;
+        add_header X-Accel-Buffering "no"      always;
+    }
+
+    # FFT WebSocket (visualizer)
+    location /ws-stats {
+        proxy_pass         http://127.0.0.1:7891/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;   # map: upgrade for WS, close for HTTP
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+    }
+
+    # ==============================================================================
+    # 4. GRAFANA И ICECAST (ПРОКСИРОВАНИЕ)
+    # ==============================================================================
+
+    location /monitoring/ {
+        auth_basic           "Monitoring";
+        auth_basic_user_file /etc/nginx/.grafana_htpasswd;
+
+        proxy_pass         http://127.0.0.1:3000/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        $connection_upgrade;
+
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    location /admin/ {
+        proxy_pass         http://127.0.0.1:8000/admin/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_pass_header  Authorization;
+    }
+
+    location = /status-json.xsl {
+        proxy_pass         http://127.0.0.1:8000/status-json.xsl;
+        proxy_http_version 1.1;   # keepalive to Icecast upstream
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 2s;
+        proxy_read_timeout    5s;
+
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control               "no-cache" always;
+        add_header Access-Control-Allow-Origin "*"        always;
+    }
+
+    # ==============================================================================
+    # 5. СТАТИКА САЙТА И БЕЗОПАСНОСТЬ
+    # ==============================================================================
+
+    # Block dotfiles (.env, .git, etc.) — must be early, uses regex so checked last
+    location ~ /\.(?!well-known).* {
+        deny all;
+    }
+
+    location / {
+        limit_req zone=one burst=30 nodelay;
+        try_files $uri $uri/ =404;
+    }
+
+    # JS/CSS — no cache (Vite may or may not hash filenames; keep safe with no-cache)
+    location ~* \.(css|js)$ {
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        try_files $uri =404;
+    }
+
+    # Images and fonts — aggressive immutable cache (30 days)
+    location ~* \.(jpg|jpeg|png|gif|ico|webp|svg|woff|woff2|ttf)$ {
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control "public, max-age=2592000, immutable" always;
+        access_log off;
+        try_files  $uri =404;
+    }
+
+    location = /manifest.json {
+        default_type application/manifest+json;
+        include /etc/nginx/snippets/security_headers.conf;
+        add_header Cache-Control "public, max-age=3600" always;
+        try_files $uri =404;
+    }
+}

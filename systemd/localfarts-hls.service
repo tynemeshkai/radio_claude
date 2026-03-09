@@ -1,0 +1,77 @@
+[Unit]
+Description=LOCAL FARTS Adaptive HLS (Multi-bitrate)
+After=network-online.target localfarts.service icecast2.service
+Wants=network-online.target
+Requires=localfarts.service icecast2.service
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+SuccessExitStatus=0 255
+TimeoutStopSec=20
+LimitNOFILE=65536
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
+WorkingDirectory=/dev/shm/hls
+
+# Создаём директории, чистим старые сегменты
+ExecStartPre=+/usr/bin/install -d -o www-data -g www-data -m 775 /dev/shm/hls /dev/shm/hls/high /dev/shm/hls/mid /dev/shm/hls/low
+ExecStartPre=+/bin/sh -c 'find /dev/shm/hls -type f ! -name "master.m3u8" -delete'
+
+# =========================================================================================
+# MASTERING CHAIN
+#
+# Источник: Liquidsoap → FLAC lossless → Icecast (OGG/FLAC)
+# Нормализация: Autocue (EBU R128, -16 LUFS) уже применена в Liquidsoap.
+#
+# Задача этой цепочки — ТОЛЬКО safety processing перед AAC-кодированием:
+#
+#   1. volume -2dB        — headroom sandwich: снижаем уровень перед фильтрами
+#   2. highpass 20Hz      — убирает DC offset и инфрабас (не слышен, жрёт headroom)
+#   3. EQ (4 полосы)      — тонкая коррекция под радиовещание:
+#                            +1.5 dB @ 60 Hz   — теплота баса
+#                            -1.2 dB @ 350 Hz  — убираем мутность (muddy box)
+#                            -1.5 dB @ 3 kHz   — снижаем резкость/утомляемость
+#                            -0.5 dB @ 8.5 kHz — смягчаем сибилянты
+#   4. volume +2dB        — возвращаем уровень (sandwich закрыт)
+#   5. alimiter -1 dBTP   — ловит пики от кроссфейда, даёт AAC headroom
+#                            (стандарт: Apple Music, Spotify, EBU R128 = -1 dBTP)
+#
+# НЕТ компрессора  — autocue уже нормализовал, компрессор убивает динамику
+# НЕТ aresample    — источник уже 44100 Hz, async=1000 вызывает клики
+# НЕТ asetpts      — с OGG/FLAC источником timestamps корректные,
+#                     asetpts=N/SR/TB вызывает DTS overflow после 4-6 часов работы
+# =========================================================================================
+
+ExecStart=/bin/bash -c 'exec /usr/bin/ffmpeg -nostdin -hide_banner -loglevel warning \
+  -rw_timeout 15000000 \
+  -reconnect 1 -reconnect_streamed 1 -reconnect_at_eof 1 -reconnect_delay_max 2 \
+  -fflags +genpts+nobuffer \
+  -flags low_delay \
+  -thread_queue_size 4096 \
+  -i http://127.0.0.1:8000/stream_lossless.ogg \
+  -filter_complex "[0:a]aformat=sample_fmts=fltp,volume=-2dB,highpass=f=20:poles=2,equalizer=f=85:width_type=o:width=1:g=1.5,equalizer=f=350:width_type=o:width=1:g=-1.2,equalizer=f=3000:width_type=o:width=1:g=-0.5,equalizer=f=8500:width_type=o:width=1.2:g=-0.5,volume=2dB,alimiter=level_in=1:level_out=1:limit=0.891:attack=5:release=80:level=disabled,asplit=3[a1][a2][a3]" \
+  -map "[a1]" -c:a:0 aac -profile:a aac_low -b:a:0 256k \
+  -map "[a2]" -c:a:1 aac -profile:a aac_low -b:a:1 192k \
+  -map "[a3]" -c:a:2 aac -profile:a aac_low -b:a:2 128k \
+  -max_muxing_queue_size 4096 \
+  -f hls \
+  -hls_time 6 -hls_list_size 20 -hls_delete_threshold 10 \
+  -hls_segment_type fmp4 \
+  -hls_fmp4_init_filename "init-%%v-$(date +%%s).mp4" \
+  -hls_flags delete_segments+independent_segments+program_date_time+omit_endlist \
+  -start_number $(date +%%s) \
+  -var_stream_map "a:0,name:high a:1,name:mid a:2,name:low" \
+  -hls_segment_filename "%%v/live-%%010d.m4s" \
+  "%%v/live.m3u8"'
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,189 @@
+# 1. HTTP -> HTTPS Redirect
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name localfarts.lol www.localfarts.lol;
+    return 301 https://$host$request_uri;
+}
+
+# 2. HTTPS (Основной сервер)
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2 ipv6only=on;
+    server_name localfarts.lol www.localfarts.lol;
+
+    # --- SSL ---
+    ssl_certificate /etc/letsencrypt/live/localfarts.lol/fullchain.pem; 
+    ssl_certificate_key /etc/letsencrypt/live/localfarts.lol/privkey.pem; 
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # --- НОВАЯ НАСТРОЙКА: KEEPALIVE (Стабильность HLS) ---
+    # Позволяет клиенту качать много сегментов без пересоздания соединения
+    keepalive_timeout 65;
+    keepalive_requests 100;
+
+    # --- STEALTH & SECURITY ---
+    # Блокировка плохих ботов
+    if ($http_user_agent ~* (AhrefsBot|DotBot|PetalBot|SemrushBot|MJ12bot|MegaIndex|SerpstatBot|HubSpot|Go-http-client|Python-urllib)) {
+        return 444;
+    }
+
+    # Заголовки безопасности
+    add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+
+    # --- ОПТИМИЗАЦИЯ СЖАТИЯ (GZIP) ---
+    gzip on;
+    gzip_vary on;
+    # ВАЖНО: Сжимаем m3u8 плейлисты
+    gzip_types text/plain application/xml application/json application/vnd.apple.mpegurl;
+    gzip_min_length 1000;
+
+    root /var/www/html;
+    index index.html;
+
+# =========================================================
+    # HLS CONFIGURATION (PRO TUNING)
+    # =========================================================
+location /hls/ {
+        root /dev/shm;
+        tcp_nodelay on;
+
+        # УБИРАЕМ "access_log off;" ОТСЮДА!
+        # Мы перенесем его ниже.
+
+        log_not_found off;
+
+        types {
+            application/vnd.apple.mpegurl m3u8;
+            video/mp2t ts;
+        }
+        add_header Access-Control-Allow-Origin * always;
+
+        # --- ПЛЕЙЛИСТЫ (.m3u8) ---
+        # ЭТО СЧЕТЧИК ЛЮДЕЙ. ВКЛЮЧАЕМ ЛОГИ!
+        location ~ \.m3u8$ {
+            root /dev/shm;
+            
+            # Включаем запись в лог только для плейлистов
+            access_log /var/log/nginx/access.log; 
+            
+            expires -1;
+            add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+            add_header Pragma "no-cache" always;
+            add_header Access-Control-Allow-Origin * always;
+        }
+
+        # --- СЕГМЕНТЫ (.ts) ---
+        # ЭТО МУСОР. ЛОГИ ВЫКЛЮЧЕНЫ.
+        location ~ \.ts$ {
+            root /dev/shm;
+            
+            # Сегменты не пишем в лог, экономим диск
+            access_log off; 
+            
+            expires max;
+            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            add_header Access-Control-Allow-Origin * always;
+        }
+    }
+
+    # =========================================================
+    # === SANDBOX (ТЕСТЫ) ===
+    # =========================================================
+    location /zalupa {
+        index index.html;        
+        try_files $uri $uri/ =404;
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+        expires -1;
+    }
+
+    location /teststream {
+        proxy_pass http://127.0.0.1:8000/testlive;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 86400s;
+    }
+
+    # =========================================================
+    # === ICECAST PROXY ===
+    # =========================================================
+
+    # ГЛАВНАЯ
+    location / {
+        limit_req zone=one burst=10 nodelay;
+        try_files $uri $uri/ =404;
+    }
+
+    # СТАТУС (JSON)
+    location /status-json.xsl {
+        proxy_pass http://127.0.0.1:8000/status-json.xsl;
+        add_header Access-Control-Allow-Origin *;
+        
+        # Кэш статуса (защита Icecast)
+        proxy_cache icecast_stat_cache;
+        proxy_cache_valid 200 3s;
+        proxy_cache_lock on;
+        proxy_cache_use_stale error timeout updating;
+        add_header X-Cache-Status $upstream_cache_status;
+    }
+
+    # АУДИО ПОТОК (ОСНОВНОЙ - ПРЯМОЙ ЭФИР НЕ HLS)
+    location /stream {
+        # Защита от хотлинка
+        valid_referers none blocked server_names *.localfarts.lol; 
+        if ($invalid_referer) { return 403; }
+
+        proxy_pass http://127.0.0.1:8000/stream;
+        
+        # КРИТИЧЕСКИ ВАЖНО ДЛЯ LIVE:
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_ignore_client_abort on;
+        tcp_nodelay on;
+        
+        # Таймауты (сутки)
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        
+        # Передача IP
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        # Запрет кэширования потока
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Expires "0";
+    }
+
+    # АДМИНКА
+    location /admin/ {
+        proxy_pass http://127.0.0.1:8000/admin/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_pass_header Authorization;
+        add_header X-Frame-Options "SAMEORIGIN";
+        add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
+    }
+
+    location /style.css {
+        proxy_pass http://127.0.0.1:8000/style.css;
+    }
+
+    # ИСТОРИЯ
+    location = /history.txt {
+        root /srv/radio/radio_data; 
+        default_type text/plain;
+        add_header Cache-Control "no-cache, no-store, must-revalidate, max-age=0";
+        add_header Access-Control-Allow-Origin *; 
+        try_files $uri =404;
+    }
+}

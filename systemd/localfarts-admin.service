@@ -1,0 +1,21 @@
+[Unit]
+Description=LOCAL FARTS Radio Admin API
+After=network.target localfarts.service
+Wants=localfarts.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/radio/admin-api
+ExecStart=/usr/local/bin/uvicorn main:app --host 127.0.0.1 --port 8888 --workers 1
+Restart=always
+RestartSec=5
+
+# Передаём токен через env-файл
+EnvironmentFile=-/srv/radio/.admin_env
+
+# Безопасность
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
