@@ -217,7 +217,7 @@ export async function fetchHistory() {
             }
         } catch (e) {}
 
-        if (tracks.length === 0) {
+        if (timeline.length === 0) {
             const textRes = await fetchNoStore(CONFIG.historyUrl + "?t=" + Date.now());
             if (textRes.ok) {
                 const text = await textRes.text();
@@ -262,6 +262,12 @@ function syncTrackToHistoryTimeline(force = false) {
     if (!force && (!state.isPlaying || DOM.audio.paused)) return;
     if (!state.historyTimeline.length) return;
 
+    // SSE/nowplaying.json — авторитетный источник текущего трека.
+    // Если отображаемый трек совпадает с тем, что подтвердил сервер, не даём
+    // устаревшему historyTimeline откатить его назад (race condition: history
+    // обновляется раз в 20с, а SSE приходит немедленно).
+    if (!force && state.lastNowPlayingTrack && state.currentDisplayedTrack === state.lastNowPlayingTrack) return;
+
     const playheadMs = estimateClientPlayoutMs();
 
     let candidate = state.historyTimeline.find(item => item.startedAtMs > 0 && item.startedAtMs <= playheadMs) || state.historyTimeline[state.historyTimeline.length - 1];
@@ -269,6 +275,14 @@ function syncTrackToHistoryTimeline(force = false) {
 
     const key = makeHistoryTrackKey(candidate);
     if (!force && key === state.currentTrackKey) return;
+
+    // Если трек был выставлен авторитетным источником (SSE/nowplaying) менее 5 секунд назад,
+    // не даём historyTimeline перебить его — защита от snap-back в момент смены трека.
+    if (!force) {
+        const authSources = new Set(['sse', 'nowplaying']);
+        if (authSources.has(state.currentTrackSource) && state.lastTrackAppliedAt &&
+            (getAlignedNowMs() - state.lastTrackAppliedAt) < 5000) return;
+    }
 
     state.metaQueue = [];
     applyTrackChange(candidate.track, "history-timeline", key);
@@ -358,6 +372,9 @@ export function processMetaQueue() {
             const next = state.metaQueue.shift();
             // applyTrackChange автоматически обновляет и сайт, и экран блокировки (MediaSession)
             applyTrackChange(next.title, next.source, next.trackKey);
+            // Сразу обновляем historyTimeline — иначе stale-данные (обновление раз в 20с)
+            // могут подставить в renderHistory предыдущий трек вместо нового.
+            fetchHistory();
         }
     }
     syncTrackToHistoryTimeline(false);
@@ -424,5 +441,14 @@ export function startNetworkLoops() {
         initSSE();
         fetchNowPlaying(true);
         fetchHistory();
+    });
+
+    // Немедленно обновляем историю когда трек сменяется,
+    // не дожидаясь следующего цикла fetchHistory (до 20 сек).
+    window.addEventListener('track-changed', () => {
+        if (!state.historyTimeline.length) return;
+        const tracks = state.historyTimeline.map(x => x.track);
+        const visible = tracks.filter((t, idx) => !(idx === 0 && t === state.currentDisplayedTrack));
+        renderHistory(visible.length === 0 ? ["История пуста..."] : visible.slice(0, 3));
     });
 }
