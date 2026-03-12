@@ -67,6 +67,13 @@ server {
         auth_basic    off;
         root          /dev/shm;
 
+        # CRITICAL: disable open_file_cache for HLS.
+        # FFmpeg atomically replaces .m3u8 playlists via rename() → new inode at same path.
+        # open_file_cache holds the OLD fd → nginx serves stale playlist via sendfile() for
+        # up to open_file_cache_valid seconds → HLS.js misses new segments → ~1s freeze
+        # every 30s. Disabling here has zero cost: /dev/shm is RAM, stat()/open() are ~100ns.
+        open_file_cache off;
+
         # Buffered log — reduces disk I/O at high listener counts
         access_log    /var/log/nginx/hls_access.log combined buffer=32k flush=5s;
         log_not_found off;
@@ -129,6 +136,12 @@ server {
         default_type application/json;
         try_files    $uri =404;
 
+        # write_history.sh uses mv (rename) → new inode at same path.
+        # open_file_cache would serve the old inode for up to open_file_cache_valid
+        # seconds. Off here since SSE already delivers real-time updates, and polling
+        # fallback must see fresh data immediately.
+        open_file_cache off;
+
         include /etc/nginx/snippets/security_headers.conf;
         add_header Cache-Control                 "no-cache, no-store, must-revalidate, max-age=0" always;
         add_header Access-Control-Allow-Origin   "*"                                               always;
@@ -141,6 +154,8 @@ server {
         default_type application/json;
         try_files    $uri =404;
 
+        open_file_cache off;  # written atomically via mv — same inode issue as nowplaying.json
+
         include /etc/nginx/snippets/security_headers.conf;
         add_header Cache-Control               "no-cache, no-store, must-revalidate, max-age=0" always;
         add_header Access-Control-Allow-Origin "*"                                               always;
@@ -151,6 +166,8 @@ server {
         root         /srv/radio/radio_data;
         default_type text/plain;
         try_files    $uri =404;
+
+        open_file_cache off;  # written atomically via mv
 
         include /etc/nginx/snippets/security_headers.conf;
         add_header Cache-Control               "no-cache, no-store, must-revalidate, max-age=0" always;
@@ -206,6 +223,11 @@ server {
         alias      /srv/radio/admin/;
         index      index.html;
         try_files  $uri $uri/ /panel/index.html;
+
+        # Relaxed CSP: admin panel loads React + Babel from cdnjs CDN and
+        # runs Babel JSX compilation at runtime (requires 'unsafe-eval').
+        # Uses a separate snippet to avoid duplicate CSP headers.
+        include /etc/nginx/snippets/security_headers_admin.conf;
     }
 
     location /api/ {
