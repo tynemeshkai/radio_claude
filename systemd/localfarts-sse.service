@@ -2,8 +2,9 @@
 Description=LOCAL FARTS Server-Sent Events (SSE) Microservice
 # Ждем поднятия сети и основного сервиса радио
 After=network.target localfarts.service
-# Жесткая привязка: если localfarts.service падает или перезапускается, этот сервис делает то же самое
-BindsTo=localfarts.service
+# BindsTo removed: SSE server only reads nowplaying.json from disk — it does NOT
+# depend on Liquidsoap being alive. BindsTo caused all client SSE connections to
+# drop on every Liquidsoap restart (deploys, config reloads). After= is sufficient.
 
 [Service]
 Type=simple
